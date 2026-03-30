@@ -3,16 +3,32 @@
 Application Python avec interface graphique pour :
 
 - enregistrer depuis le microphone du PC,
+- **choisir le micro système** à utiliser,
+- visualiser un **VU-mètre** en direct pendant l'enregistrement,
 - importer des fichiers audio/vidéo par glisser-déposer,
-- transcrire avec **faster-whisper** (rapide et fiable),
-- stocker les résultats dans des dossiers nommables (ou nom par défaut `Enregistrement du ...`),
-- réorganiser les dossiers et fichiers depuis l'interface.
+- transcrire avec **faster-whisper**,
+- valider la transcription,
+- générer un **compte-rendu médical** éditable en **DOCX** ou exportable en **PDF**.
 
-## Pourquoi `faster-whisper` ?
+## Fonctionnalités médicales ajoutées
 
-`faster-whisper` (basé sur CTranslate2) est généralement plus rapide et plus sobre en mémoire que l'implémentation Whisper d'origine, avec une bonne qualité de transcription.
+Après transcription :
 
-Le projet inclut un script de benchmark local pour **vérifier la performance sur votre machine** (CPU/GPU), car les performances réelles dépendent du matériel.
+1. Validation manuelle de la transcription (`Valider la transcription`).
+2. Préremplissage automatique (si détecté) :
+   - Nom patient
+   - Prénom patient
+   - Date de naissance
+   - Motif de consultation
+3. Édition manuelle des champs si non détectés.
+4. Génération du rapport structuré :
+   - Identification patient
+   - Motif de consultation
+   - Discussion patient/parents/praticien (si identifiable)
+   - Symptômes et anamnèse
+   - Explications et conduite à tenir
+   - Autres praticiens mentionnés
+5. Export en `.docx` ou `.pdf`.
 
 ## Prérequis
 
@@ -30,38 +46,10 @@ pip install -r requirements.txt
 ## Lancement
 
 ```bash
-python app.py
-```
-
-## Lancement en une commande (Linux/macOS)
-
-```bash
 ./run_local.sh
 ```
 
 Le script crée automatiquement `.venv`, installe les dépendances, puis lance l'application.
-
-## Utilisation rapide
-
-1. Choisissez le modèle (`tiny`, `base`, `small`, `medium`, `large-v3`).
-2. Créez/sélectionnez un dossier de travail à gauche.
-3. Glissez-déposez un fichier (`.mp3`, `.mp4`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.mov`, `.mkv`, etc.) dans la zone prévue.
-4. Ou enregistrez depuis le micro (`Démarrer micro` puis `Arrêter micro`).
-5. Cliquez `Transcrire`.
-6. Le texte est sauvegardé dans le dossier sélectionné (`.txt` + `.json`).
-
-## Benchmark local (optionnel)
-
-```bash
-python benchmark.py --file /chemin/vers/audio.mp3 --model small
-```
-
-Le script affiche:
-- durée audio,
-- temps de transcription,
-- ratio temps réel (RTF = temps_transcription / durée_audio).
-
-Plus le RTF est bas, plus c'est rapide.
 
 ## Structure de sortie
 
@@ -69,12 +57,12 @@ Par dossier de session :
 - média source (si copié/importé)
 - `transcription.txt`
 - `transcription.json`
+- `Compte_rendu_<Nom>_<Prénom>.docx` ou `.pdf`
 
-## Évolution SaaS (prochaine étape)
+## Benchmark local (optionnel)
 
-Cette base sépare déjà :
-- couche GUI,
-- couche transcription,
-- gestion des sessions/fichiers.
+```bash
+python benchmark.py --file /chemin/vers/audio.mp3 --model small
+```
 
-Cela facilite la migration vers une API backend (FastAPI) + frontend web.
+Le script affiche le ratio temps réel (RTF) pour valider la performance sur votre machine.
