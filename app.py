@@ -1,10 +1,13 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
-import queue
+import os
 import re
 import shutil
-import threading
+import subprocess
+import sys
+import time as _time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,24 +16,44 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import tkinter as tk
-from docx import Document
+from PySide6.QtCore import QDir, QThread, QTimer, Qt, Signal, Slot, QSize
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QPalette
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFileSystemModel,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSplitter,
+    QTabWidget,
+    QToolBar,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
+)
+
 from faster_whisper import WhisperModel
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from tkinter import filedialog, messagebox, simpledialog, StringVar
-from tkinter import ttk
-from tkinterdnd2 import DND_FILES, TkinterDnD
 
-AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
-SUPPORTED_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
-
-
-@dataclass
-class SessionFolder:
-    name: str
-    path: Path
+APP_NAME = "VoiceScribe Medical"
+APP_VERSION = "2.0.0"
+SUPPORTED_AUDIO = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".wma", ".aac", ".opus"}
+SUPPORTED_VIDEO = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".webm", ".flv", ".m4v"}
+SUPPORTED_ALL = SUPPORTED_AUDIO | SUPPORTED_VIDEO
 
 
 @dataclass
@@ -39,153 +62,71 @@ class PatientInfo:
     prenom: str = ""
     date_naissance: str = ""
     motif_consultation: str = ""
-
-
-class AudioRecorder:
-    def __init__(self, samplerate: int = 16000, channels: int = 1):
-        self.samplerate = samplerate
-        self.channels = channels
-        self.device: Optional[int] = None
-        self.q: queue.Queue = queue.Queue()
-        self.stream: Optional[sd.InputStream] = None
-        self._frames = []
-        self.is_recording = False
-        self.level = 0.0
-
-    def _callback(self, indata, _frames, _time, status):
-        if status:
-            print(status)
-        self.q.put(indata.copy())
-        rms = float(np.sqrt(np.mean(np.square(indata)))) if indata.size else 0.0
-        self.level = min(max(rms * 30.0, 0.0), 1.0)
-
-    def start(self, device: Optional[int]):
-        self._frames = []
-        self.device = device
-        self.is_recording = True
-        self.level = 0.0
-        self.stream = sd.InputStream(
-            samplerate=self.samplerate,
-            channels=self.channels,
-            device=device,
-            callback=self._callback,
-        )
-        self.stream.start()
-
-    def stop(self, output_file: Path) -> Path:
-        if not self.stream:
-            raise RuntimeError("Aucun enregistrement en cours.")
-
-        self.is_recording = False
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
-
-        while not self.q.empty():
-            self._frames.append(self.q.get())
-
-        if not self._frames:
-            raise RuntimeError("Aucun audio capturé.")
-
-        audio = np.concatenate(self._frames, axis=0)
-        sf.write(str(output_file), audio, self.samplerate)
-        self.level = 0.0
-        return output_file
-
-
-class Transcriber:
-    def __init__(self):
-        self.model_name: Optional[str] = None
-        self.model: Optional[WhisperModel] = None
-
-    def load_model(self, model_name: str):
-        if self.model is not None and self.model_name == model_name:
-            return
-
-        device = "cuda" if self._cuda_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        self.model_name = model_name
-
-    @staticmethod
-    def _cuda_available() -> bool:
-        try:
-            import torch
-
-            return bool(torch.cuda.is_available())
-        except Exception:
-            return False
-
-    def transcribe(self, input_path: Path, language: Optional[str] = "fr"):
-        if self.model is None:
-            raise RuntimeError("Modèle non chargé.")
-
-        segments, info = self.model.transcribe(str(input_path), language=language, vad_filter=True, beam_size=5)
-
-        full_text = []
-        json_segments = []
-        for seg in segments:
-            text = seg.text.strip()
-            if text:
-                full_text.append(text)
-            json_segments.append({"start": seg.start, "end": seg.end, "text": text})
-
-        return {
-            "text": "\n".join(full_text),
-            "segments": json_segments,
-            "language": info.language,
-            "language_probability": info.language_probability,
-        }
+    praticiens: str = ""
 
 
 class MedicalReportBuilder:
-    @staticmethod
-    def extract_patient_info(transcript: str) -> PatientInfo:
-        nom = MedicalReportBuilder._search(transcript, [r"nom\s*[:\-]\s*([A-Za-zÀ-ÖØ-öø-ÿ'\- ]+)"])
-        prenom = MedicalReportBuilder._search(transcript, [r"pr[ée]nom\s*[:\-]\s*([A-Za-zÀ-ÖØ-öø-ÿ'\- ]+)"])
-        dob = MedicalReportBuilder._search(
-            transcript,
-            [
-                r"date de naissance\s*[:\-]\s*(\d{2}[/-]\d{2}[/-]\d{4})",
-                r"n[ée] le\s*(\d{2}[/-]\d{2}[/-]\d{4})",
-            ],
-        )
-        motif = MedicalReportBuilder._search(transcript, [r"motif(?: de la consultation)?\s*[:\-]\s*([^\.\n]+)"])
-        return PatientInfo(nom=nom, prenom=prenom, date_naissance=dob, motif_consultation=motif)
-
     @staticmethod
     def _search(text: str, patterns: list[str]) -> str:
         for pattern in patterns:
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if match:
-                return match.group(1).strip()
+                return match.group(1).strip(" .,:;\n")
         return ""
 
     @staticmethod
-    def _sentences_with_keywords(text: str, keywords: list[str]) -> str:
+    def _sentences_with_keywords(text: str, keywords: list[str], max_items: int = 12) -> str:
         sentences = re.split(r"(?<=[\.!?])\s+", text.replace("\n", " "))
         selected = [s.strip() for s in sentences if any(k.lower() in s.lower() for k in keywords)]
-        return "\n".join(selected[:10]) if selected else "À compléter manuellement."
+        return "\n".join(selected[:max_items]) if selected else "À compléter manuellement."
 
     @staticmethod
-    def build_report_text(transcript: str, info: PatientInfo) -> str:
-        discussion = MedicalReportBuilder._sentences_with_keywords(
+    def extract_patient_info(transcript: str) -> PatientInfo:
+        nom = MedicalReportBuilder._search(
             transcript,
-            ["patient", "parent", "mère", "père", "praticien", "docteur"],
+            [
+                r"nom\s*(?:du patient)?\s*[:\-]\s*([A-Za-zÀ-ÖØ-öø-ÿ'\- ]+)",
+                r"madame\s+([A-Za-zÀ-ÖØ-öø-ÿ'\- ]+)",
+                r"monsieur\s+([A-Za-zÀ-ÖØ-öø-ÿ'\- ]+)",
+            ],
         )
-        symptomes = MedicalReportBuilder._sentences_with_keywords(
+        prenom = MedicalReportBuilder._search(
             transcript,
-            ["sympt", "douleur", "fièvre", "toux", "fatigue", "anamnèse", "antécédent"],
+            [r"pr[ée]nom\s*(?:du patient)?\s*[:\-]\s*([A-Za-zÀ-ÖØ-öø-ÿ'\- ]+)"]
         )
-        conduite = MedicalReportBuilder._sentences_with_keywords(
+        dob = MedicalReportBuilder._search(
             transcript,
-            ["précon", "ordonnance", "suivi", "traitement", "conduite", "recommand"],
+            [r"date de naissance\s*[:\-]\s*(\d{2}[/-]\d{2}[/-]\d{4})", r"n[ée] le\s*(\d{2}[/-]\d{2}[/-]\d{4})"],
+        )
+        motif = MedicalReportBuilder._search(
+            transcript,
+            [r"motif(?: de la consultation)?\s*[:\-]\s*([^\.\n]+)"]
         )
         praticiens = MedicalReportBuilder._sentences_with_keywords(
             transcript,
-            ["spécialiste", "cardiologue", "radiologue", "kiné", "ORL", "pédiatre", "neurologue"],
+            [
+                "dr ",
+                "docteur",
+                "praticien",
+                "infirmier",
+                "infirmière",
+                "kiné",
+                "cardiologue",
+                "neurologue",
+                "radiologue",
+                "orl",
+                "pédiatre",
+                "intervenant",
+            ],
+            max_items=8,
         )
+        return PatientInfo(nom=nom, prenom=prenom, date_naissance=dob, motif_consultation=motif, praticiens=praticiens)
 
+    @staticmethod
+    def build_report_text(transcript: str, info: PatientInfo) -> str:
+        discussion = MedicalReportBuilder._sentences_with_keywords(transcript, ["patient", "parent", "mère", "père", "praticien", "docteur"])
+        symptomes = MedicalReportBuilder._sentences_with_keywords(transcript, ["sympt", "douleur", "fièvre", "toux", "fatigue", "anamnèse", "antécédent"])
+        conduite = MedicalReportBuilder._sentences_with_keywords(transcript, ["précon", "ordonnance", "suivi", "traitement", "conduite", "recommand"])
         return f"""COMPTE-RENDU MÉDICAL
 
 1) Identification du patient
@@ -205,400 +146,464 @@ class MedicalReportBuilder:
 5) Explications du praticien et conduite à tenir
 {conduite}
 
-6) Praticiens mentionnés dans le dossier
-{praticiens}
-
----
-Transcript source :
-{transcript}
+6) Praticiens / intervenants mentionnés
+{info.praticiens}
 """
 
-    @staticmethod
-    def export_docx(path: Path, report_text: str):
-        doc = Document()
-        for line in report_text.split("\n"):
-            doc.add_paragraph(line)
-        doc.save(str(path))
+
+class AudioRecorder(QThread):
+    level_changed = Signal(float)
+    recording_finished = Signal(str)
+    error_occurred = Signal(str)
+
+    def __init__(self, output_path: str, sample_rate: int = 16000, channels: int = 1, device: Optional[int] = None):
+        super().__init__()
+        self.output_path = output_path
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.device = device
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        frames: list[np.ndarray] = []
+
+        def _callback(indata, _frame_count, _time_info, status):
+            if status:
+                pass
+            if not self._running:
+                raise sd.CallbackAbort
+            frames.append(indata.copy())
+            rms = float(np.sqrt(np.mean(indata**2))) if indata.size else 0.0
+            self.level_changed.emit(rms)
+
+        try:
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                blocksize=1024,
+                device=self.device,
+                callback=_callback,
+            ):
+                while self._running:
+                    self.msleep(50)
+
+            if frames:
+                audio = np.concatenate(frames, axis=0)
+                sf.write(self.output_path, audio, self.sample_rate)
+                self.recording_finished.emit(self.output_path)
+            else:
+                self.error_occurred.emit("Aucune donnée audio capturée. Vérifiez le micro sélectionné.")
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+
+class TranscriptionWorker(QThread):
+    progress = Signal(str)
+    segment_ready = Signal(str)
+    finished = Signal(str, str)
+    error_occurred = Signal(str)
+
+    def __init__(self, media_path: str, model_name: str, language: str, output_dir: str):
+        super().__init__()
+        self.media_path = media_path
+        self.model_name = model_name
+        self.language = language
+        self.output_dir = output_dir
 
     @staticmethod
-    def export_pdf(path: Path, report_text: str):
-        c = canvas.Canvas(str(path), pagesize=A4)
-        width, height = A4
-        y = height - 40
-        for line in report_text.split("\n"):
-            if y < 40:
-                c.showPage()
-                y = height - 40
-            c.drawString(40, y, line[:140])
-            y -= 14
-        c.save()
+    def _fmt(seconds: float) -> str:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        cs = int((seconds % 1) * 100)
+        return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}" if h else f"{m:02d}:{s:02d}.{cs:02d}"
+
+    def run(self):
+        try:
+            device = "cpu"
+            compute_type = "int8"
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    device = "cuda"
+                    compute_type = "float16"
+            except Exception:
+                pass
+
+            self.progress.emit(f"Chargement du modèle {self.model_name} ({device})…")
+            model = WhisperModel(self.model_name, device=device, compute_type=compute_type)
+            self.progress.emit("Transcription en cours…")
+            t0 = _time.perf_counter()
+            lang = None if self.language == "auto" else self.language
+            segments_gen, info = model.transcribe(self.media_path, language=lang, beam_size=5, vad_filter=True)
+
+            lines_ts: list[str] = []
+            lines_plain: list[str] = []
+            for seg in segments_gen:
+                line = f"[{self._fmt(seg.start)} → {self._fmt(seg.end)}]  {seg.text.strip()}"
+                lines_ts.append(line)
+                if seg.text.strip():
+                    lines_plain.append(seg.text.strip())
+                self.segment_ready.emit(line)
+
+            full_ts = "\n".join(lines_ts)
+            full_plain = "\n".join(lines_plain)
+            elapsed = _time.perf_counter() - t0
+
+            stem = Path(self.media_path).stem
+            txt_path = Path(self.output_dir) / f"{stem}_transcription.txt"
+            txt_path.write_text(full_ts + "\n\nTEXTE BRUT\n" + full_plain, encoding="utf-8")
+
+            report_info = MedicalReportBuilder.extract_patient_info(full_plain)
+            report_text = MedicalReportBuilder.build_report_text(full_plain, report_info)
+            report_path = Path(self.output_dir) / f"{stem}_compte_rendu.txt"
+            report_path.write_text(report_text, encoding="utf-8")
+
+            meta = {
+                "source": os.path.basename(self.media_path),
+                "language": info.language,
+                "confidence": info.language_probability,
+                "elapsed": elapsed,
+                "report": str(report_path),
+            }
+            (Path(self.output_dir) / f"{stem}_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            self.finished.emit(full_ts, str(txt_path))
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
 
 
-class App:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Transcripteur Speech-to-Text + Rapport médical")
-        self.root.geometry("1250x760")
+class AudioDeviceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected_device = None
+        self.setWindowTitle("Sélection du microphone")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Choisissez le microphone :"))
+        self.combo = QComboBox()
+        self._map: dict[int, int] = {}
+        idx = 0
+        for i, dev in enumerate(sd.query_devices()):
+            if dev.get("max_input_channels", 0) > 0:
+                self.combo.addItem(f"{dev['name']} ({int(dev['default_samplerate'])} Hz)")
+                self._map[idx] = i
+                idx += 1
+        lay.addWidget(self.combo)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._ok)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
 
+    def _ok(self):
+        self.selected_device = self._map.get(self.combo.currentIndex())
+        self.accept()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
         self.workspace = Path.cwd() / "sessions"
         self.workspace.mkdir(exist_ok=True)
-
-        self.transcriber = Transcriber()
-        self.recorder = AudioRecorder()
-
-        self.current_file: Optional[Path] = None
-        self.current_session: Optional[SessionFolder] = None
-        self.last_transcript: str = ""
-        self.transcript_validated = False
-
-        self.model_var = StringVar(value="small")
-        self.lang_var = StringVar(value="fr")
-        self.mic_var = StringVar(value="")
-
-        self.patient_nom = StringVar(value="")
-        self.patient_prenom = StringVar(value="")
-        self.patient_dob = StringVar(value="")
-        self.patient_motif = StringVar(value="")
-
-        self._mic_map: dict[str, int] = {}
+        self._recorder: Optional[AudioRecorder] = None
+        self._worker: Optional[TranscriptionWorker] = None
+        self._selected_mic: Optional[int] = None
+        self._is_recording = False
+        self._rec_start: Optional[datetime] = None
+        self._queue: list[tuple[str, str]] = []
+        self._busy = False
 
         self._build_ui()
-        self.refresh_sessions()
-        self.refresh_microphones()
-        self._refresh_vumeter()
+        self._build_menu()
+        self._connect()
+
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.resize(1280, 820)
+        self.statusBar().showMessage("Prêt")
 
     def _build_ui(self):
-        container = tk.Frame(self.root)
-        container.pack(fill="both", expand=True)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
 
-        left = tk.Frame(container, bd=1, relief="solid")
-        left.pack(side="left", fill="y", padx=8, pady=8)
+        tb = QToolBar("Outils")
+        tb.setIconSize(QSize(18, 18))
+        tb.setMovable(False)
+        self.addToolBar(tb)
 
-        tk.Label(left, text="Sessions", font=("Arial", 12, "bold")).pack(padx=8, pady=8)
-        self.session_list = tk.Listbox(left, width=34, height=24)
-        self.session_list.pack(padx=8, pady=8, fill="y")
-        self.session_list.bind("<<ListboxSelect>>", self._on_session_select)
+        self.logo_label = QLabel("🎙")
+        for c in ["logo.png", "logo.jpg", "logo.jpeg", "logo.ico"]:
+            p = Path(c)
+            if p.exists():
+                self.logo_label.setText(f"Logo: {p.name}")
+                break
+        tb.addWidget(self.logo_label)
 
-        tk.Button(left, text="Nouvelle session", command=self.create_session).pack(fill="x", padx=8, pady=4)
-        tk.Button(left, text="Renommer session", command=self.rename_session).pack(fill="x", padx=8, pady=4)
-        tk.Button(left, text="Supprimer session", command=self.delete_session).pack(fill="x", padx=8, pady=4)
+        self.btn_rec = QPushButton("🎙 Enregistrer")
+        self.btn_pause = QPushButton("⏸ Pause")
+        self.btn_pause.setEnabled(False)
+        self.btn_import = QPushButton("📂 Importer")
+        self.btn_folder = QPushButton("📁 Nouveau dossier")
+        self.btn_settings = QPushButton("🎤 Choisir micro")
+        self.btn_transcribe = QPushButton("▶ Transcrire la sélection")
 
-        right = tk.Frame(container)
-        right.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        for b in [self.btn_rec, self.btn_pause, self.btn_import, self.btn_folder, self.btn_settings]:
+            tb.addWidget(b)
 
-        controls = tk.Frame(right)
-        controls.pack(fill="x", pady=6)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+        tb.addWidget(self.btn_transcribe)
 
-        tk.Label(controls, text="Modèle:").grid(row=0, column=0, sticky="w")
-        tk.OptionMenu(controls, self.model_var, "tiny", "base", "small", "medium", "large-v3").grid(row=0, column=1, sticky="w")
+        splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(splitter, 1)
 
-        tk.Label(controls, text="Langue:").grid(row=0, column=2, sticky="w", padx=(10, 0))
-        tk.Entry(controls, textvariable=self.lang_var, width=8).grid(row=0, column=3, sticky="w")
+        left = QWidget()
+        l = QVBoxLayout(left)
+        l.addWidget(QLabel("📁 Gestionnaire de fichiers"))
+        self.fs_model = QFileSystemModel()
+        self.fs_model.setRootPath(str(self.workspace))
+        self.fs_model.setFilter(QDir.AllDirs | QDir.Files | QDir.NoDotAndDotDot)
+        self.tree = QTreeView()
+        self.tree.setModel(self.fs_model)
+        self.tree.setRootIndex(self.fs_model.index(str(self.workspace)))
+        self.tree.hideColumn(2)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        l.addWidget(self.tree)
 
-        tk.Label(controls, text="Micro:").grid(row=0, column=4, sticky="w", padx=(10, 0))
-        self.mic_combo = ttk.Combobox(controls, textvariable=self.mic_var, width=40, state="readonly")
-        self.mic_combo.grid(row=0, column=5, sticky="w")
-        tk.Button(controls, text="Rafraîchir micros", command=self.refresh_microphones).grid(row=0, column=6, padx=6)
+        row = QHBoxLayout()
+        self.btn_rename = QPushButton("✏️ Renommer")
+        self.btn_delete = QPushButton("🗑 Supprimer")
+        self.btn_open = QPushButton("📂 Ouvrir dossier")
+        row.addWidget(self.btn_rename)
+        row.addWidget(self.btn_delete)
+        row.addWidget(self.btn_open)
+        l.addLayout(row)
+        splitter.addWidget(left)
 
-        tk.Button(controls, text="Transcrire", command=self.run_transcription).grid(row=0, column=7, padx=6)
+        right = QWidget()
+        r = QVBoxLayout(right)
+        self.lbl_status = QLabel("")
+        self.level = QProgressBar()
+        self.level.setMaximum(100)
+        self.chrono = QLabel("00:00")
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Niveau"))
+        top.addWidget(self.level, 1)
+        top.addWidget(self.chrono)
+        r.addLayout(top)
+        r.addWidget(self.lbl_status)
 
-        self.drop_label = tk.Label(
-            right,
-            text="Glissez-déposez un fichier audio/vidéo ici\nou cliquez sur 'Choisir un fichier'",
-            bd=2,
-            relief="groove",
-            height=4,
-        )
-        self.drop_label.pack(fill="x", pady=8)
-        self.drop_label.drop_target_register(DND_FILES)
-        self.drop_label.dnd_bind("<<Drop>>", self._on_drop_file)
+        tabs = QTabWidget()
+        self.txt_result = QPlainTextEdit()
+        self.txt_queue = QPlainTextEdit()
+        self.txt_queue.setReadOnly(True)
+        self.txt_result.setReadOnly(True)
+        tabs.addTab(self.txt_result, "Transcription")
+        tabs.addTab(self.txt_queue, "File d'attente")
+        r.addWidget(tabs, 1)
+        splitter.addWidget(right)
 
-        row2 = tk.Frame(right)
-        row2.pack(fill="x", pady=4)
-        tk.Button(row2, text="Choisir un fichier", command=self.pick_file).pack(side="left")
-        tk.Button(row2, text="Démarrer micro", command=self.start_recording).pack(side="left", padx=6)
-        tk.Button(row2, text="Arrêter micro", command=self.stop_recording).pack(side="left", padx=6)
+        self.timer = QTimer()
+        self.timer.setInterval(500)
 
-        tk.Label(row2, text="VU-mètre:").pack(side="left", padx=(20, 4))
-        self.vumeter = ttk.Progressbar(row2, orient="horizontal", mode="determinate", length=220, maximum=100)
-        self.vumeter.pack(side="left")
+    def _build_menu(self):
+        m = self.menuBar()
+        f = m.addMenu("Fichier")
+        f.addAction(QAction("Importer", self, triggered=self._import_files))
+        f.addAction(QAction("Nouveau dossier", self, triggered=self._create_folder))
 
-        self.status = tk.Label(right, text="Prêt", anchor="w")
-        self.status.pack(fill="x", pady=4)
-        self.file_label = tk.Label(right, text="Aucun fichier sélectionné", fg="gray")
-        self.file_label.pack(fill="x")
+    def _connect(self):
+        self.btn_import.clicked.connect(self._import_files)
+        self.btn_folder.clicked.connect(self._create_folder)
+        self.btn_rename.clicked.connect(self._rename_selected)
+        self.btn_delete.clicked.connect(self._delete_selected)
+        self.btn_open.clicked.connect(lambda: self._open_path(str(self.workspace)))
+        self.btn_transcribe.clicked.connect(self._transcribe_selected)
+        self.btn_rec.clicked.connect(self._toggle_record)
+        self.btn_settings.clicked.connect(self._select_mic)
+        self.tree.customContextMenuRequested.connect(self._tree_context)
+        self.tree.doubleClicked.connect(self._on_dbl)
+        self.timer.timeout.connect(self._tick)
 
-        center = tk.PanedWindow(right, orient="horizontal", sashrelief="raised")
-        center.pack(fill="both", expand=True, pady=8)
+    def _make_folder(self) -> str:
+        return f"Enregistrement du {datetime.now():%Y-%m-%d %Hh%Mm%Ss}"
 
-        trans_frame = tk.Frame(center)
-        center.add(trans_frame, minsize=500)
-        tk.Label(trans_frame, text="Transcription", font=("Arial", 11, "bold")).pack(anchor="w")
-        self.output_text = tk.Text(trans_frame, wrap="word")
-        self.output_text.pack(fill="both", expand=True)
-
-        report_frame = tk.Frame(center)
-        center.add(report_frame, minsize=520)
-        tk.Label(report_frame, text="Validation & Rapport médical", font=("Arial", 11, "bold")).pack(anchor="w")
-
-        form = tk.Frame(report_frame)
-        form.pack(fill="x", pady=4)
-        self._labeled_entry(form, "Nom patient", self.patient_nom, 0)
-        self._labeled_entry(form, "Prénom patient", self.patient_prenom, 1)
-        self._labeled_entry(form, "Date de naissance", self.patient_dob, 2)
-        self._labeled_entry(form, "Motif consultation", self.patient_motif, 3, width=45)
-
-        actions = tk.Frame(report_frame)
-        actions.pack(fill="x", pady=6)
-        self.validate_button = tk.Button(actions, text="Valider la transcription", command=self.validate_transcription, state="disabled")
-        self.validate_button.pack(side="left")
-        tk.Button(actions, text="Générer DOCX", command=lambda: self.generate_report("docx")).pack(side="left", padx=6)
-        tk.Button(actions, text="Générer PDF", command=lambda: self.generate_report("pdf")).pack(side="left", padx=6)
-
-        self.report_preview = tk.Text(report_frame, wrap="word")
-        self.report_preview.pack(fill="both", expand=True)
-
-    def _labeled_entry(self, parent, label: str, variable: StringVar, row: int, width: int = 28):
-        tk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=2, pady=2)
-        tk.Entry(parent, textvariable=variable, width=width).grid(row=row, column=1, sticky="w", padx=2, pady=2)
-
-    def refresh_microphones(self):
-        self._mic_map.clear()
-        names = []
-        for idx, device in enumerate(sd.query_devices()):
-            if int(device.get("max_input_channels", 0)) > 0:
-                label = f"{idx} - {device.get('name', 'Microphone')}"
-                self._mic_map[label] = idx
-                names.append(label)
-
-        self.mic_combo["values"] = names
-        if names:
-            if self.mic_var.get() not in names:
-                self.mic_var.set(names[0])
+    def _toggle_record(self):
+        if self._is_recording:
+            self._stop_record()
         else:
-            self.mic_var.set("")
-            messagebox.showwarning("Microphone", "Aucun micro détecté.")
+            self._start_record()
 
-    def _refresh_vumeter(self):
-        level_percent = int(self.recorder.level * 100)
-        self.vumeter["value"] = level_percent
-        self.root.after(100, self._refresh_vumeter)
+    def _start_record(self):
+        folder = self.workspace / self._make_folder()
+        folder.mkdir(exist_ok=True)
+        wav = folder / "enregistrement.wav"
+        self._recorder = AudioRecorder(str(wav), device=self._selected_mic)
+        self._recorder.level_changed.connect(lambda x: self.level.setValue(min(int(x * 400), 100)))
+        self._recorder.recording_finished.connect(self._on_record_done)
+        self._recorder.error_occurred.connect(lambda e: QMessageBox.critical(self, "Micro", e))
+        self._recorder.start()
+        self._is_recording = True
+        self._rec_start = datetime.now()
+        self.timer.start()
+        self.btn_rec.setText("⏹ Arrêter")
+        self.statusBar().showMessage("Enregistrement en cours")
 
-    def refresh_sessions(self):
-        self.session_list.delete(0, tk.END)
-        for path in sorted(self.workspace.glob("*")):
+    def _stop_record(self):
+        if self._recorder:
+            self._recorder.stop()
+            self._recorder.wait(5000)
+        self._is_recording = False
+        self.btn_rec.setText("🎙 Enregistrer")
+        self.timer.stop()
+
+    @Slot(str)
+    def _on_record_done(self, path: str):
+        self.statusBar().showMessage(f"Audio sauvegardé : {path}")
+        self._enqueue(path, str(Path(path).parent))
+
+    def _tick(self):
+        if not self._rec_start:
+            return
+        d = int((datetime.now() - self._rec_start).total_seconds())
+        m, s = divmod(d, 60)
+        h, m = divmod(m, 60)
+        self.chrono.setText(f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}")
+
+    def _select_mic(self):
+        dlg = AudioDeviceDialog(self)
+        if dlg.exec() and dlg.selected_device is not None:
+            self._selected_mic = dlg.selected_device
+            dev = sd.query_devices(dlg.selected_device)
+            self.statusBar().showMessage(f"Micro sélectionné : {dev['name']}")
+
+    def _import_files(self):
+        ext_str = " ".join(f"*{e}" for e in sorted(SUPPORTED_ALL))
+        paths, _ = QFileDialog.getOpenFileNames(self, "Importer", "", f"Médias ({ext_str});;Tous (*)")
+        for i, src in enumerate(paths):
+            folder = self.workspace / (self._make_folder() + (f" ({i+1})" if i else ""))
+            folder.mkdir(exist_ok=True)
+            dest = folder / Path(src).name
+            shutil.copy2(src, dest)
+            self._enqueue(str(dest), str(folder))
+
+    def _enqueue(self, media_path: str, out_dir: str):
+        self._queue.append((media_path, out_dir))
+        self._refresh_queue()
+        if not self._busy:
+            self._run_next()
+
+    def _refresh_queue(self):
+        if not self._queue:
+            self.txt_queue.setPlainText("File d'attente vide")
+        else:
+            self.txt_queue.setPlainText("\n".join(f"{i+1}. {Path(p).name}" for i, (p, _) in enumerate(self._queue)))
+
+    def _run_next(self):
+        if not self._queue:
+            self._busy = False
+            self.lbl_status.setText("✅ Terminé")
+            return
+        self._busy = True
+        media_path, out_dir = self._queue.pop(0)
+        self._refresh_queue()
+        self.txt_result.clear()
+        self._worker = TranscriptionWorker(media_path, "base", "fr", out_dir)
+        self._worker.progress.connect(lambda m: self.lbl_status.setText(m))
+        self._worker.segment_ready.connect(self.txt_result.appendPlainText)
+        self._worker.finished.connect(self._on_done)
+        self._worker.error_occurred.connect(lambda e: QMessageBox.critical(self, "Erreur", e))
+        self._worker.start()
+
+    @Slot(str, str)
+    def _on_done(self, _full_text: str, txt_path: str):
+        self.statusBar().showMessage(f"Transcription sauvegardée: {txt_path}")
+        self._run_next()
+
+    def _transcribe_selected(self):
+        idx = self.tree.currentIndex()
+        if not idx.isValid():
+            QMessageBox.information(self, "Sélection", "Sélectionnez un fichier audio/vidéo.")
+            return
+        p = Path(self.fs_model.filePath(idx))
+        if p.suffix.lower() not in SUPPORTED_ALL:
+            QMessageBox.warning(self, "Format", "Format non supporté.")
+            return
+        self._enqueue(str(p), str(p.parent))
+
+    def _create_folder(self):
+        name, ok = QInputDialog.getText(self, "Nouveau dossier", "Nom du dossier :", text=self._make_folder())
+        if ok and name.strip():
+            (self.workspace / name.strip()).mkdir(exist_ok=True)
+
+    def _rename_selected(self):
+        idx = self.tree.currentIndex()
+        if not idx.isValid():
+            return
+        path = Path(self.fs_model.filePath(idx))
+        new, ok = QInputDialog.getText(self, "Renommer", "Nouveau nom :", text=path.name)
+        if ok and new.strip() and new.strip() != path.name:
+            path.rename(path.parent / new.strip())
+
+    def _delete_selected(self):
+        idx = self.tree.currentIndex()
+        if not idx.isValid():
+            return
+        path = Path(self.fs_model.filePath(idx))
+        if QMessageBox.question(self, "Supprimer", f"Supprimer {path.name} ?") == QMessageBox.Yes:
             if path.is_dir():
-                self.session_list.insert(tk.END, path.name)
-
-    def _get_selected_session(self) -> Optional[SessionFolder]:
-        selection = self.session_list.curselection()
-        if not selection:
-            return None
-        name = self.session_list.get(selection[0])
-        return SessionFolder(name=name, path=self.workspace / name)
-
-    def _on_session_select(self, _event=None):
-        self.current_session = self._get_selected_session()
-        if self.current_session:
-            self._set_status(f"Session active: {self.current_session.name}")
-
-    def create_session(self):
-        default_name = f"Enregistrement du {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}"
-        name = simpledialog.askstring("Nouvelle session", "Nom de la session:", initialvalue=default_name)
-        if not name:
-            return
-        path = self.workspace / name
-        path.mkdir(exist_ok=True)
-        self.refresh_sessions()
-        self._set_status(f"Session créée: {name}")
-
-    def rename_session(self):
-        session = self._get_selected_session()
-        if not session:
-            messagebox.showwarning("Attention", "Sélectionnez une session.")
-            return
-        new_name = simpledialog.askstring("Renommer", "Nouveau nom:", initialvalue=session.name)
-        if not new_name:
-            return
-        session.path.rename(self.workspace / new_name)
-        self.refresh_sessions()
-        self._set_status(f"Session renommée en: {new_name}")
-
-    def delete_session(self):
-        session = self._get_selected_session()
-        if not session:
-            messagebox.showwarning("Attention", "Sélectionnez une session.")
-            return
-        if messagebox.askyesno("Confirmation", f"Supprimer la session '{session.name}' ?"):
-            shutil.rmtree(session.path)
-            self.refresh_sessions()
-            self._set_status("Session supprimée")
-
-    def pick_file(self):
-        file_path = filedialog.askopenfilename(
-            title="Choisir un fichier",
-            filetypes=[("Média", "*.mp3 *.wav *.m4a *.flac *.ogg *.aac *.wma *.mp4 *.mov *.mkv *.avi *.webm *.m4v")],
-        )
-        if file_path:
-            self._set_current_file(Path(file_path))
-
-    def _on_drop_file(self, event):
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            raw = raw[1:-1]
-        self._set_current_file(Path(raw))
-
-    def _set_current_file(self, path: Path):
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            messagebox.showerror("Erreur", "Format non supporté.")
-            return
-        self.current_file = path
-        self.file_label.config(text=f"Fichier: {path}", fg="black")
-        self._set_status("Fichier prêt.")
-
-    def start_recording(self):
-        try:
-            mic_label = self.mic_var.get().strip()
-            if not mic_label:
-                raise RuntimeError("Sélectionnez un microphone.")
-            device_index = self._mic_map.get(mic_label)
-            self.recorder.start(device=device_index)
-            self._set_status(f"Enregistrement micro en cours ({mic_label})...")
-        except Exception as exc:
-            messagebox.showerror("Erreur micro", str(exc))
-
-    def stop_recording(self):
-        try:
-            session = self._ensure_session()
-            out = session.path / f"micro_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-            self.recorder.stop(out)
-            self._set_current_file(out)
-            self._set_status("Enregistrement terminé.")
-        except Exception as exc:
-            messagebox.showerror("Erreur micro", str(exc))
-
-    def _ensure_session(self) -> SessionFolder:
-        session = self._get_selected_session()
-        if session:
-            self.current_session = session
-            return session
-        default_name = f"Enregistrement du {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}"
-        path = self.workspace / default_name
-        path.mkdir(exist_ok=True)
-        self.refresh_sessions()
-        self.current_session = SessionFolder(default_name, path)
-        return self.current_session
-
-    def run_transcription(self):
-        if not self.current_file:
-            messagebox.showwarning("Attention", "Veuillez importer un fichier ou enregistrer le micro.")
-            return
-        if not self.current_file.exists():
-            messagebox.showerror("Erreur", "Fichier introuvable.")
-            return
-
-        self.transcript_validated = False
-        self.validate_button.config(state="disabled")
-
-        session = self._ensure_session()
-        thread = threading.Thread(target=self._transcribe_worker, args=(session, self.current_file), daemon=True)
-        thread.start()
-
-    def _transcribe_worker(self, session: SessionFolder, file_path: Path):
-        try:
-            self.root.after(0, lambda: self._set_status("Chargement du modèle..."))
-            self.transcriber.load_model(self.model_var.get())
-
-            target_media = session.path / file_path.name
-            if file_path.resolve() != target_media.resolve():
-                shutil.copy2(file_path, target_media)
+                shutil.rmtree(path)
             else:
-                target_media = file_path
+                path.unlink(missing_ok=True)
 
-            self.root.after(0, lambda: self._set_status("Transcription en cours..."))
-            result = self.transcriber.transcribe(target_media, language=self.lang_var.get().strip() or None)
-
-            (session.path / "transcription.txt").write_text(result["text"], encoding="utf-8")
-            (session.path / "transcription.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            self.last_transcript = result["text"]
-            self.root.after(0, lambda: self._display_transcript(result["text"], session.path))
-        except Exception as exc:
-            self.root.after(0, lambda: messagebox.showerror("Erreur transcription", str(exc)))
-            self.root.after(0, lambda: self._set_status(f"Erreur: {exc}"))
-
-    def _display_transcript(self, text: str, session_path: Path):
-        self.output_text.delete("1.0", tk.END)
-        self.output_text.insert("1.0", text)
-        self.validate_button.config(state="normal")
-
-        info = MedicalReportBuilder.extract_patient_info(text)
-        self.patient_nom.set(info.nom)
-        self.patient_prenom.set(info.prenom)
-        self.patient_dob.set(info.date_naissance)
-        self.patient_motif.set(info.motif_consultation)
-
-        self._set_status(f"Transcription terminée. Sauvegardé dans {session_path}")
-
-    def validate_transcription(self):
-        text = self.output_text.get("1.0", tk.END).strip()
-        if not text:
-            messagebox.showwarning("Validation", "Aucune transcription à valider.")
-            return
-
-        self.transcript_validated = True
-        info = PatientInfo(
-            nom=self.patient_nom.get().strip(),
-            prenom=self.patient_prenom.get().strip(),
-            date_naissance=self.patient_dob.get().strip(),
-            motif_consultation=self.patient_motif.get().strip(),
-        )
-        report = MedicalReportBuilder.build_report_text(text, info)
-        self.report_preview.delete("1.0", tk.END)
-        self.report_preview.insert("1.0", report)
-        self._set_status("Transcription validée. Rapport prêt à être exporté.")
-
-    def generate_report(self, output_format: str):
-        if not self.transcript_validated:
-            messagebox.showwarning("Rapport", "Validez d'abord la transcription.")
-            return
-
-        session = self._ensure_session()
-        report_text = self.report_preview.get("1.0", tk.END).strip()
-        if not report_text:
-            messagebox.showwarning("Rapport", "Aucun contenu de rapport.")
-            return
-
-        safe_nom = (self.patient_nom.get() or "Patient").replace(" ", "_")
-        safe_prenom = (self.patient_prenom.get() or "Inconnu").replace(" ", "_")
-        base_name = f"Compte_rendu_{safe_nom}_{safe_prenom}"
-
-        if output_format == "docx":
-            out_path = session.path / f"{base_name}.docx"
-            MedicalReportBuilder.export_docx(out_path, report_text)
-        elif output_format == "pdf":
-            out_path = session.path / f"{base_name}.pdf"
-            MedicalReportBuilder.export_pdf(out_path, report_text)
+    def _tree_context(self, pos):
+        idx = self.tree.indexAt(pos)
+        menu = QMenu(self)
+        if idx.isValid():
+            path = Path(self.fs_model.filePath(idx))
+            if path.suffix.lower() in SUPPORTED_ALL:
+                menu.addAction("▶ Transcrire", lambda: self._enqueue(str(path), str(path.parent)))
+                menu.addAction("🎧 Lire", lambda: self._open_path(str(path)))
+                menu.addSeparator()
+            menu.addAction("✏️ Renommer", self._rename_selected)
+            menu.addAction("🗑 Supprimer", self._delete_selected)
         else:
-            messagebox.showerror("Rapport", "Format non supporté.")
-            return
+            menu.addAction("📁 Nouveau dossier", self._create_folder)
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
 
-        self._set_status(f"Rapport exporté: {out_path}")
-        messagebox.showinfo("Rapport", f"Rapport généré: {out_path}")
+    def _on_dbl(self, idx):
+        path = Path(self.fs_model.filePath(idx))
+        if path.suffix.lower() in SUPPORTED_ALL:
+            self._open_path(str(path))
 
-    def _set_status(self, msg: str):
-        self.status.config(text=msg)
-        self.root.update_idletasks()
-
-
-def build_root():
-    return TkinterDnD.Tk()
+    @staticmethod
+    def _open_path(path: str):
+        QDesktopServices.openUrl(Path(path).as_uri())
 
 
 def main():
-    root = build_root()
-    App(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(42, 42, 46))
+    pal.setColor(QPalette.WindowText, QColor(218, 218, 218))
+    pal.setColor(QPalette.Base, QColor(28, 28, 32))
+    pal.setColor(QPalette.Text, QColor(218, 218, 218))
+    pal.setColor(QPalette.Button, QColor(52, 52, 56))
+    pal.setColor(QPalette.ButtonText, QColor(218, 218, 218))
+    pal.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    pal.setColor(QPalette.HighlightedText, Qt.white)
+    app.setPalette(pal)
+
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
