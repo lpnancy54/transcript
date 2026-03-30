@@ -33,6 +33,14 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Lancement en une commande (Linux/macOS)
+
+```bash
+./run_local.sh
+```
+
+Le script crée automatiquement `.venv`, installe les dépendances, puis lance l'application.
+
 ## Utilisation rapide
 
 1. Choisissez le modèle (`tiny`, `base`, `small`, `medium`, `large-v3`).
